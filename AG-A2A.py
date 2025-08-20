@@ -110,46 +110,6 @@ class Distributed_Column_Linear(DistributedLinearBase):
         return final_result, elapsed_ns
 
 
-class Distributed_Row_Linear(DistributedLinearBase):
-    def __init__(self, rank, world_size, inter_dim, output_dim, weight, data_sizes):
-        super().__init__(rank, world_size, inter_dim, output_dim, weight, data_sizes)
-        self.local_inter_dim = inter_dim // world_size
-        self.local_o_proj = self._create_row_linear()
-        
-    def _create_row_linear(self):
-        """Create the local linear projection for this rank"""
-        local_o_proj = nn.Linear(
-            in_features=self.local_inter_dim, 
-            out_features=self.output_dim, 
-            bias=False, 
-            dtype=torch.half, 
-            device=self.device
-        )
-        local_weight = self.weight[self.rank*self.local_inter_dim : (self.rank+1)*self.local_inter_dim, :].npu()
-        local_o_proj.weight = nn.Parameter(local_weight)
-        return local_o_proj
-    
-    def forward(self, hidden_states):
-        """Perform the distributed forward pass for row parallelism"""
-        torch.npu.synchronize()
-        start_time = time.perf_counter_ns()
-        
-        # Split input along the feature dimension
-        input_splits = torch.split(hidden_states, self.local_inter_dim, dim=1)
-        local_input = input_splits[self.rank]
-        
-        # Local matrix multiplication
-        local_output = self.local_o_proj(local_input)
-        
-        # All-reduce across all ranks
-        output = torch.zeros_like(local_output)
-        dist.all_reduce(local_output, output=output, op=dist.ReduceOp.SUM)
-        
-        torch.npu.synchronize()
-        elapsed_ns = time.perf_counter_ns() - start_time
-        
-        return output, elapsed_ns
-
 
 def worker_process(rank, world_size, data_sizes, weight, inter_dim, output_dim):
     """Worker process function for each rank"""

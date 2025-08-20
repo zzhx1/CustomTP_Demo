@@ -5,7 +5,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import time
 import os 
-
 os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
 
 class MLPLinear:
@@ -43,9 +42,9 @@ class MLPLinear:
             in_features = self.hidden_dim
             out_features = self.local_output_dim
         elif direction == "down":
-            self.local_output_dim = self.local_hidden_dim
-            in_features = self.inter_dim
-            out_features = self.local_output_dim
+            self.local_in_dim = self.local_inter_dim
+            in_features = self.local_in_dim
+            out_features = self.hidden_dim
 
         local_linear = nn.Linear(
             in_features=in_features, 
@@ -66,43 +65,44 @@ class MLPLinear:
     
     
     def forward(self, hidden_states):
-        """Perform the distributed forward pass"""
+        """Perform the custom virtual TP forward pass"""
         torch.npu.synchronize()
         start_time = time.perf_counter_ns()
         local_batch_size = hidden_states.size(0)
-        # All gather input from all ranks
-        gathered_input = [torch.empty(batch_size, hidden_states.size(1), 
-                                    dtype=hidden_states.dtype, device='npu') 
-                         for batch_size in self.data_sizes]
-    
-        dist.all_gather(gathered_input, hidden_states)
-        complete_input = torch.cat(gathered_input, dim=0)
 
-        # Local matrix multiplication for the up projection
+        # 1. All-Gather: Gather all data within the computation group
+        # Create complete input tensor
+        total_batch_size = sum(self.data_sizes)
+        complete_input = torch.empty(
+            total_batch_size, 
+            hidden_states.size(1),
+            dtype=hidden_states.dtype,
+            device=self.device
+        )
+
+        dist.all_gather_into_tensor(complete_input, hidden_states)
+        
         gate_up_result = self.gate_up_proj(complete_input)
 
-        print(f"rank:{dist.get_rank()}: gate_up_result: {gate_up_result.shape} ")
-        # Perform local matrix multiplication for the down projection
         down_result = self.down_proj(gate_up_result)
-        print(f"rank:{dist.get_rank()}: down_result: {down_result.shape} ")
 
+        # 4. Reduce-Scatter: Aggregate and distribute results
+        # Create a buffer to receive the final data belonging to this rank
         final_result = torch.empty(
-            down_result.size(0),
+            local_batch_size, 
             self.hidden_dim,
-            dtype=down_result.dtype, device='npu'
+            dtype=down_result.dtype,
+            device=self.device
         )
-        # 将down_result转换为列表
-        output_list = [torch.empty_like(final_result) for _ in range(self.world_size)]
-        output_list[self.rank] = down_result
-
-        dist.reduce_scatter(final_result, output_list, op=dist.ReduceOp.SUM)
-        final_result = final_result[self.rank*local_batch_size : (self.rank+1)*local_batch_size, :]
+        
+        dist.reduce_scatter_tensor(final_result, down_result, op=dist.ReduceOp.SUM)
+        print(f"rank: {dist.get_rank()}, final_result shape:{final_result.shape}")
         
         torch.npu.synchronize()
         elapsed_ns = time.perf_counter_ns() - start_time
         
         return final_result, elapsed_ns
-    
+
     def verify_accuracy(self, hidden_states, distributed_result):
         """Verify the distributed computation matches the full computation"""
 
@@ -142,25 +142,26 @@ def worker_process(rank, world_size, data_sizes, weight_up, weight_down, hidden_
     print(f"Rank {rank} starting...")
     
     # Create distributed linear layer
-    dist_linear = MLPLinear(rank,  world_size, data_sizes, weight_up, weight_down, hidden_dim, inter_dim)
+    dist_linear = MLPLinear(rank, world_size, data_sizes, weight_up, weight_down, hidden_dim, inter_dim)
     
     # Generate input data
     hidden_states = torch.randn(data_sizes[rank], hidden_dim, device=dist_linear.device)
     
     # Perform distributed forward pass
     for i in range(1):
-
         final_result, elapsed_ns = dist_linear.forward(hidden_states)
         
         print_time(i, elapsed_ns, rank)
-    # Verify accuracy
-    dist_linear.verify_accuracy(hidden_states, final_result)
+    
+    # Verify accuracy (only on rank 0 to avoid multiple verifications)
+    if rank == 0:
+        dist_linear.verify_accuracy(hidden_states, final_result)
     
     # Clean up
     dist_linear.cleanup()
 
 def print_time(iter, elapsed_ns, rank):
-    # Print timing information
+    """Print timing information"""
     if rank == 0:
         print(f"iteration {iter}")
     torch.npu.synchronize()
@@ -168,7 +169,7 @@ def print_time(iter, elapsed_ns, rank):
         elapsed_str = f"{elapsed_ns/1_000_000:.3f} ms"
     else:
         elapsed_str = f"{elapsed_ns/1000:.3f} us"
-    print(f"    Rank {rank}: Communication time is {elapsed_str}")
+    print(f"Rank {rank}: Communication time is {elapsed_str}")
 
 if __name__ == "__main__":
     # Configuration parameters
@@ -185,5 +186,4 @@ if __name__ == "__main__":
         worker_process,
         args=(world_size, data_sizes, weight_up, weight_down, hidden_dim, inter_dim),
         nprocs=world_size,
-        join=True
-    )
+        join=True)
